@@ -1,0 +1,434 @@
+# ---------------------------------------------------------------------------
+# Project: SHORT-TERM WIND POWER PREDICTION
+#
+
+# To run this script, you will need to:
+# 1. Install all required libraries (numpy, pandas, tensorflow, sklearn).
+# 2. Download the project's data files.
+# 3. Update the file paths in the `main()` function at the bottom of 
+#    this script to point to your local data files.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Standard libraries for data manipulation and plotting
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# TensorFlow and Keras for deep learning
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Dense, LSTM, Conv1D, Add, Concatenate, GRU, Flatten,
+    RepeatVector, Attention, Dropout, BatchNormalization, Activation,
+    GlobalAveragePooling1D, Multiply
+) # Corrected from 'ConvID', 'Repeat Vector.', 'GlobalAverage Pooling ID'
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+
+# Scikit-learn for data preprocessing and metrics
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split # Corrected from 'train test_split'
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+
+# 8.2 Utility Functions
+# ---------------------------------------------------------------------------
+
+def fix_time_column(df, time_col="Time"):
+    """Fix time column format to ensure consistency"""
+    if time_col in df.columns:
+        # Convert the time column to datetime objects using the specified format
+        df[time_col] = pd.to_datetime(df[time_col], format="%d/%m/%Y %H:%M")
+    return df
+
+def prepare_sequence_data(train_df, test_df, target_df, seq_length=2, forecast_horizon=2):
+    """
+    Prepare sequence data for the Res-ConvLSTM-Attention model.
+    
+    Args:
+        train_df: DataFrame containing training features
+        test_df: DataFrame containing test features
+        target_df: DataFrame containing target values for training
+        seq_length: Length of input sequences
+        forecast_horizon: How far ahead to predict
+    
+    Returns:
+        Xl_train: Historical sequence data for training
+        X2_train: Current/forecast data for training
+        y_train: Target values for training
+        Xl_test: Historical sequence data for testing
+        X2_test: Current/forecast data for testing
+        test_ids: IDs for test predictions
+    """
+    
+    # Print column names to debug
+    print("Columns in train_df:", train_df.columns.tolist())
+    print("Columns in test_df:", test_df.columns.tolist())
+    
+    # Verify 'WF' column exists and add a default if not
+    if 'WF' not in train_df.columns:
+        print("ERROR: 'WF' column missing from train_df")
+        train_df['WF'] = 'WF1' # Default value
+    if 'WF' not in test_df.columns:
+        print("ERROR: 'WF' column missing from test_df")
+        test_df['WF'] = 'WF1'
+        
+    # Merge training features with target values
+    train_with_target = pd.merge(train_df, target_df, on='ID', how='inner')
+    
+    # Get list of numeric features (excluding ID, Time, and target)
+    # IMPORTANT: Also exclude 'WF' from scaling
+    feature_cols = [col for col in train_df.columns
+                    if col not in ['ID', 'Time', 'Production', 'WF']]
+    
+    # Create a scaler and fit on training data
+    scaler = StandardScaler()
+    scaler.fit(train_df[feature_cols])
+    
+    # Transform both training and test data
+    train_scaled = scaler.transform(train_df[feature_cols])
+    test_scaled = scaler.transform(test_df[feature_cols])
+    
+    # Convert back to DataFrames with original index
+    train_scaled_df = pd.DataFrame(train_scaled, columns=feature_cols, index=train_df.index)
+    test_scaled_df = pd.DataFrame(test_scaled, columns=feature_cols, index=test_df.index)
+    
+    # Add ID, Time, and WF back
+    train_scaled_df['ID'] = train_df['ID'].values
+    train_scaled_df['Time'] = train_df['Time'].values
+    train_scaled_df['WF'] = train_df['WF'].values
+    test_scaled_df['ID'] = test_df['ID'].values
+    test_scaled_df['Time'] = test_df['Time'].values
+    test_scaled_df['WF'] = test_df['WF'].values
+    
+    # Add target to scaled training data
+    train_with_target_scaled = pd.merge(train_scaled_df, target_df, on='ID', how='inner')
+    
+    # Initialize lists to store sequences
+    X1_train_sequences = []
+    X2_train_values = []
+    y_train_values = []
+    X1_test_sequences = []
+    X2_test_values = []
+    test_ids = []
+    
+    # Group by wind farm for training data
+    for wf, group in train_with_target_scaled.groupby('WF'):
+        # Sort by time
+        group = group.sort_values('Time')
+        
+        # Create sequences
+        for i in range(len(group) - seq_length - forecast_horizon + 1):
+            # Historical sequence (input1)
+            X1_seq = group.iloc[i:i + seq_length][feature_cols].values
+            
+            # Current/forecast data (input2 features at the prediction time)
+            X2_val = group.iloc[i + seq_length + forecast_horizon - 1][feature_cols].values
+            
+            # Target value
+            y_val = group.iloc[i + seq_length + forecast_horizon - 1]['Production']
+            
+            X1_train_sequences.append(X1_seq)
+            X2_train_values.append(X2_val)
+            y_train_values.append(y_val)
+            
+    # Group by wind farm for test data
+    for wf, group in test_scaled_df.groupby('WF'):
+        # Get all training data for this wind farm
+        train_wf = train_scaled_df[train_scaled_df['WF'] == wf].sort_values('Time')
+        
+        # For each test instance
+        for i, row in group.iterrows():
+            # Find the closest time points in training data
+            # This is a simplified approach
+            closest_times_indices = (train_wf['Time'] - row['Time']).abs().argsort()[:seq_length]
+            closest_times = train_wf.iloc[closest_times_indices]['Time'].sort_values()
+            
+            if len(closest_times) == seq_length:
+                # Get historical sequence
+                history = train_wf[train_wf['Time'].isin(closest_times)].sort_values('Time')
+                X1_seq = history[feature_cols].values
+                
+                # Current forecast data
+                X2_val = row[feature_cols].values
+                
+                X1_test_sequences.append(X1_seq)
+                X2_test_values.append(X2_val)
+                test_ids.append(row['ID'])
+                
+    # Convert to numpy arrays with float32 dtype
+    X1_train = np.array(X1_train_sequences, dtype=np.float32)
+    X2_train = np.array(X2_train_values, dtype=np.float32)
+    y_train = np.array(y_train_values, dtype=np.float32)
+    X1_test = np.array(X1_test_sequences, dtype=np.float32)
+    X2_test = np.array(X2_test_values, dtype=np.float32)
+    
+    return X1_train, X2_train, y_train, X1_test, X2_test, test_ids
+
+
+# 8.3 Evaluation Metrics & 8.7 Visualization
+# ---------------------------------------------------------------------------
+# Note: Combining 8.3 and 8.7 as they are related. The advanced
+# visualization functions from 8.7 replace the simple one in 8.3.
+
+def calculate_metrics(y_true, y_pred):
+    """
+    Calculate all requested performance metrics.
+    Args:
+        y_true: Actual values
+        y_pred: Predicted values
+    Returns:
+        Dictionary of metrics
+    """
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_true, y_pred)
+    
+    # Calculate MAAPE (Mean Arctangent Absolute Percentage Error)
+    # Adding a small epsilon (1e-10) to y_true to avoid division by zero
+    maape = np.mean(np.arctan(np.abs((y_true - y_pred) / (y_true + 1e-10))))
+    
+    return {
+        'MAE': mae,
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAAPE': maape,
+        'R2': r2
+    }
+
+def visualize_training_history(history):
+    """Visualize the training history"""
+    plt.figure(figsize=(12, 5))
+    
+    # Plot Loss
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Loss')
+    plt.legend()
+    
+    # Plot Mean Absolute Error
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['mae'], label='Train MAE')
+    plt.plot(history.history['val_mae'], label='Validation MAE')
+    plt.title('Mean Absolute Error')
+    plt.legend()
+    
+    plt.show()
+
+def visualize_time_series_comparison(y_true, y_pred, title="Wind Power Prediction: Actual vs Predicted"):
+    """
+    Create a time series plot comparing actual and predicted values
+    """
+    # Create x-axis for time (hours)
+    x = np.arange(len(y_true))
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(x, y_true, 'g', label='Actual', linewidth=1)
+    plt.plot(x, y_pred, 'r--', label='Predicted', linewidth=1)
+    plt.title(title)
+    plt.xlabel('Time (h)')
+    plt.ylabel('Power (MW)')
+    plt.grid(True)
+    plt.legend()
+    
+    # Add metrics as text
+    metrics = calculate_metrics(y_true, y_pred)
+    textstr = '\n'.join([
+        f"MAE: {metrics['MAE']:.4f}",
+        f"RMSE: {metrics['RMSE']:.4f}",
+        f"R2: {metrics['R2']:.4f}" # Corrected from 'R:'
+    ])
+    
+    props = dict(boxstyle='round', facecolor='white', alpha=0.7)
+    plt.text(0.02, 0.97, textstr, transform=plt.gca().transAxes,
+             fontsize=10, verticalalignment='top', bbox=props)
+    
+    plt.tight_layout()
+    plt.savefig('wind_power_time_series.png')
+    print("Time series visualization saved as 'wind_power_time_series.png'")
+    plt.show()
+
+def visualize_actual_vs_predicted(model, X1, X2, y_true):
+    """
+    Visualize actual vs predicted values with multiple plots
+    """
+    # Generate predictions
+    y_pred = model.predict([X1, X2]).flatten()
+    print(f"Sample predictions: {y_pred[:5]}")
+    
+    # Calculate metrics
+    metrics = calculate_metrics(y_true, y_pred)
+    
+    # 1. Scatter plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot actual vs predicted
+    ax1.scatter(y_true, y_pred, alpha=0.5)
+    max_val = max(np.max(y_true), np.max(y_pred))
+    min_val = min(np.min(y_true), np.min(y_pred))
+    ax1.plot([min_val, max_val], [min_val, max_val], 'r--')
+    ax1.set_xlabel('Actual Production')
+    ax1.set_ylabel('Predicted Production')
+    ax1.set_title('Actual vs Predicted Wind Power Production')
+    
+    # Plot a residual plot
+    residuals = y_true - y_pred
+    ax2.scatter(y_pred, residuals, alpha=0.5)
+    ax2.axhline(y=0, color='r', linestyle='--')
+    ax2.set_xlabel('Predicted Production')
+    ax2.set_ylabel('Residuals')
+    ax2.set_title('Residual Plot')
+    
+    # Add metrics as text
+    textstr = '\n'.join([
+        f"MAE: {metrics['MAE']:.4f}",
+        f"MSE: {metrics['MSE']:.4f}",
+        f"RMSE: {metrics['RMSE']:.4f}",
+        f"MAAPE: {metrics['MAAPE']:.4f}",
+        f"R2: {metrics['R2']:.4f}" # Corrected from 'R'
+    ])
+    
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    ax1.text(0.05, 0.95, textstr, transform=ax1.transAxes, fontsize=10,
+             verticalalignment='top', bbox=props)
+    
+    plt.tight_layout()
+    plt.savefig('model_performance.png')
+    print("Performance visualization saved as 'model_performance.png'")
+    plt.show()
+    
+    # 2. Time series comparison
+    # Plot a subset for clarity (e.g., first 1000 points)
+    print("Displaying time series comparison for the first 1000 validation points...")
+    visualize_time_series_comparison(y_true[:1000], y_pred[:1000])
+    
+    # Print metrics
+    print("\nModel Performance Metrics (on validation set):")
+    print(f"MAE (Mean Absolute Error): {metrics['MAE']:.4f}")
+    print(f"MSE (Mean Square Error): {metrics['MSE']:.4f}")
+    print(f"RMSE (Root Mean Square Error): {metrics['RMSE']:.4f}")
+    print(f"MAAPE (Mean Arctangent Absolute Percentage Error): {metrics['MAAPE']:.4f}")
+    print(f"R2 (Coefficient of Determination): {metrics['R2']:.4f}")
+
+
+# 8.4 Building the Conv LSTM Model
+# ---------------------------------------------------------------------------
+
+def build_res_convlstm_attention_model(input_shape1, input_shape2, output_units=1):
+    """
+    Build the Res-ConvLSTM-Attention model for wind power forecasting
+    
+    Args:
+        input_shape1: Shape of the main input sequence (time_steps, features)
+        input_shape2: Shape of the secondary input (features,)
+        output_units: Number of output units (default=1 for power prediction)
+    
+    Returns:
+        Compiled Keras model
+    """
+    
+    # Ensure input_shape2 is a tuple
+    if isinstance(input_shape2, int):
+        input_shape2 = (input_shape2,)
+    
+    # --- Input 1: Historical sequence data ---
+    input1 = Input(shape=input_shape1, name='input1')
+    
+    # --- Res-ConvLSTM block ---
+    # First Conv-LSTM layer
+    conv_lstm_1 = Conv1D(filters=64, kernel_size=3, padding='same')(input1)
+    lstm1 = LSTM(64, return_sequences=True)(conv_lstm_1)
+    
+    # Second Conv-LSTM layer with residual connection
+    conv_lstm_2 = Conv1D(filters=64, kernel_size=3, padding='same')(lstm1)
+    lstm2 = LSTM(64, return_sequences=True)(conv_lstm_2)
+    res_connection1 = Add()([lstm1, lstm2])  # Resnet Layer
+    
+    # Third Conv-LSTM layer
+    conv_lstm_3 = Conv1D(filters=64, kernel_size=3, padding='same')(res_connection1)
+    lstm3 = LSTM(64, return_sequences=True)(conv_lstm_3)
+    res_connection2 = Add()([res_connection1, lstm3])  # Resnet Layer
+    
+    # Global Average Pooling instead of Flatten
+    pooled_lstm = GlobalAveragePooling1D()(res_connection2)
+    
+    # --- Input 2: Current/forecast data ---
+    input2 = Input(shape=input_shape2, name='input2')
+    
+    # 1D-CNN (Dense layer) for input2
+    cnn_input2 = Dense(64)(input2)
+    cnn_input2 = BatchNormalization()(cnn_input2)
+    cnn_input2 = Activation('relu')(cnn_input2)
+    
+    # Repeat vector to match sequence length for processing
+    # Note: input_shape1[0] is the number of time steps
+    repeat_vector = RepeatVector(input_shape1[0])(cnn_input2)
+    
+    # GRU blocks for sequential processing of current data
+    gru1 = GRU(64, return_sequences=True)(repeat_vector)
+    gru2 = GRU(64, return_sequences=True)(gru1)
+    
+    # Global Average Pooling for GRU output
+    pooled_gru = GlobalAveragePooling1D()(gru2)
+    
+    # --- Fusion and Attention ---
+    # Concatenate pooled outputs from both branches
+    concat = Concatenate()([pooled_gru, pooled_lstm])
+    
+    # Attention mechanism (simplified)
+    # This is a simple self-attention on the concatenated features
+    attention = Dense(64, activation='tanh')(concat)
+    attention_weights = Dense(1, activation='softmax')(attention) # Renamed for clarity
+    attention_output = Multiply()([concat, attention_weights])
+    
+    # --- Output Layers ---
+    # Fully connected layers
+    fc1 = Dense(64, activation='relu')(attention_output)
+    fc1 = Dropout(0.2)(fc1)
+    fc2 = Dense(32, activation='relu')(fc1)
+    fc2 = Dropout(0.2)(fc2)
+    
+    # Output layer
+    output = Dense(output_units, activation='linear')(fc2)
+    
+    # Create model
+    model = Model(inputs=[input1, input2], outputs=output)
+    
+    # Compile model
+    model.compile(
+        optimizer=Adam(learning_rate=0.001),
+        loss='mse',
+        metrics=['mae']
+    )
+    
+    return model
+
+
+# 8.5 Building the Forecasting Model (Training Function)
+# ---------------------------------------------------------------------------
+
+def train_forecasting_model(x_train_df, x_test_df, y_train_df, seq_length=24, forecast_horizon=24):
+    """
+    Train the wind power forecasting model.
+    
+    Args:
+        x_train_df: Training data with features and metadata
+        x_test_df: Test data with features and metadata
+        y_train_df: Target values for training
+        seq_length: Length of input sequences
+        forecast_horizon: How far ahead to predict
+    
+    Returns:
+        Trained model, test predictions, and training history
+    """
+    
+    print("Preparing sequence data...")
+    # Prepare sequence data
+    X1_train, X2_train, y_train, X1_test, X2_test, test_ids = \
+        prepare_sequence_data(
+            x_train_df, x_test_df, y_train_df,
+            seq_length)
